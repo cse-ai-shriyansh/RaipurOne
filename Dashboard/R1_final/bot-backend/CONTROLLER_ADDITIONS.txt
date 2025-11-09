@@ -1,0 +1,290 @@
+// ==========================================
+// ADD THESE FUNCTIONS TO workerController.js
+// (Append before module.exports = exports;)
+// ==========================================
+
+// Submit task with video and documents
+exports.submitTaskWithMedia = async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { video_url, document_url, submission_notes } = req.body;
+
+    if (!video_url) {
+      return res.status(400).json({
+        success: false,
+        message: 'Video URL is required'
+      });
+    }
+
+    const { supabase } = require('../config/supabaseClient');
+
+    const { data, error } = await supabase
+      .from('workers_tasks')
+      .update({
+        video_url,
+        document_url,
+        submission_notes,
+        submitted_at: new Date().toISOString(),
+        status: 'submitted',
+        admin_review_status: 'pending'
+      })
+      .eq('id', taskId)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    if (global.io) {
+      global.io.emit('new_submission', { taskId, message: 'New task submission' });
+    }
+
+    res.json({ success: true, message: 'Task submitted successfully', data });
+  } catch (error) {
+    console.error('Error submitting task:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Get task submission details
+exports.getTaskSubmission = async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { supabase } = require('../config/supabaseClient');
+
+    const { data, error } = await supabase
+      .from('workers_tasks')
+      .select('*')
+      .eq('id', taskId)
+      .single();
+
+    if (error) throw error;
+
+    res.json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Admin: Approve task submission
+exports.approveTaskSubmission = async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { admin_review_notes } = req.body;
+    const { supabase } = require('../config/supabaseClient');
+
+    const { data: task } = await supabase
+      .from('workers_tasks')
+      .select('*, tickets(*)')
+      .eq('id', taskId)
+      .single();
+
+    const { data: updatedTask, error } = await supabase
+      .from('workers_tasks')
+      .update({
+        admin_review_status: 'approved',
+        admin_review_notes,
+        reviewed_by: 'admin',
+        reviewed_at: new Date().toISOString(),
+        status: 'completed'
+      })
+      .eq('id', taskId)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    if (task.ticket_id) {
+      await supabase
+        .from('tickets')
+        .update({
+          status: 'resolved',
+          resolution_video_url: task.video_url,
+          resolution_document_url: task.document_url,
+          resolved_by_worker_id: task.worker_id,
+          resolved_at: new Date().toISOString()
+        })
+        .eq('id', task.ticket_id);
+    }
+
+    await supabase.from('worker_notifications').insert({
+      worker_id: task.worker_id,
+      task_id: taskId,
+      title: '✅ Work Approved',
+      message: 'Your submission has been approved!',
+      type: 'approval'
+    });
+
+    if (global.io) {
+      global.io.emit(`worker_notification_${task.worker_id}`, {
+        type: 'approval',
+        taskId
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Task approved. Video and documents sent to user.',
+      data: updatedTask
+    });
+  } catch (error) {
+    console.error('Error approving task:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Admin: Reject task submission
+exports.rejectTaskSubmission = async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { admin_review_notes } = req.body;
+    const { supabase } = require('../config/supabaseClient');
+
+    const { data: task } = await supabase
+      .from('workers_tasks')
+      .select('worker_id')
+      .eq('id', taskId)
+      .single();
+
+    const { data, error } = await supabase
+      .from('workers_tasks')
+      .update({
+        admin_review_status: 'rejected',
+        admin_review_notes: admin_review_notes || 'Work needs improvement',
+        reviewed_by: 'admin',
+        reviewed_at: new Date().toISOString(),
+        status: 'in_progress'
+      })
+      .eq('id', taskId)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    await supabase.from('worker_notifications').insert({
+      worker_id: task.worker_id,
+      task_id: taskId,
+      title: '❌ Work Rejected',
+      message: `Please resubmit: ${admin_review_notes}`,
+      type: 'rejection'
+    });
+
+    if (global.io) {
+      global.io.emit(`worker_notification_${task.worker_id}`, {
+        type: 'rejection',
+        message: admin_review_notes,
+        taskId
+      });
+    }
+
+    res.json({ success: true, message: 'Task rejected', data });
+  } catch (error) {
+    console.error('Error rejecting task:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Get all pending submissions
+exports.getPendingSubmissions = async (req, res) => {
+  try {
+    const { supabase } = require('../config/supabaseClient');
+
+    const { data, error } = await supabase
+      .from('workers_tasks')
+      .select('*, workers(*), tickets(*)')
+      .eq('admin_review_status', 'pending')
+      .eq('status', 'submitted')
+      .order('submitted_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.json({ success: true, data: data || [] });
+  } catch (error) {
+    console.error('Error fetching submissions:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Admin: Assign ticket to worker
+exports.assignTicketToWorker = async (req, res) => {
+  try {
+    const { ticket_id, worker_id, deadline } = req.body;
+
+    if (!ticket_id || !worker_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'Ticket ID and Worker ID are required'
+      });
+    }
+
+    const { supabase } = require('../config/supabaseClient');
+
+    const { data: ticket } = await supabase
+      .from('tickets')
+      .select('*')
+      .eq('id', ticket_id)
+      .single();
+
+    const { data: worker } = await supabase
+      .from('workers')
+      .select('*')
+      .eq('id', worker_id)
+      .single();
+
+    if (!ticket || !worker) {
+      return res.status(404).json({
+        success: false,
+        message: 'Ticket or Worker not found'
+      });
+    }
+
+    const { data: task, error } = await supabase
+      .from('workers_tasks')
+      .insert({
+        worker_id,
+        ticket_id,
+        task_description: ticket.query || ticket.description,
+        location: ticket.location,
+        status: 'pending',
+        assigned_at: new Date().toISOString(),
+        deadline: deadline || null,
+        priority: ticket.priority || 'medium',
+        admin_review_status: 'pending'
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    await supabase
+      .from('tickets')
+      .update({
+        status: 'in-progress',
+        assigned_worker_id: worker_id
+      })
+      .eq('id', ticket_id);
+
+    await supabase.from('worker_notifications').insert({
+      worker_id,
+      task_id: task.id,
+      title: '🔔 New Work Assignment',
+      message: `New task: ${ticket.query?.substring(0, 50)}...`,
+      type: 'assignment'
+    });
+
+    if (global.io) {
+      global.io.emit(`worker_notification_${worker_id}`, {
+        type: 'new_task',
+        taskId: task.id
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Task assigned successfully',
+      data: task
+    });
+  } catch (error) {
+    console.error('Error assigning ticket:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
